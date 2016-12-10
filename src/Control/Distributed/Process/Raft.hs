@@ -21,11 +21,12 @@ import Control.Concurrent.STM
 import Control.Distributed.Process
 import Control.Distributed.Process.Serializable
 
-import Data.Maybe
 import Data.Binary (Binary)
+import Data.List
 import qualified Data.Map.Strict as M
-import Data.Typeable
+import Data.Maybe
 import Data.Time
+import Data.Typeable
 
 import GHC.Generics
 
@@ -34,9 +35,9 @@ import GHC.Generics
 
 data Raft a = Raft ProcessId
 
-startRaft :: forall a. (Serializable a) => RaftConfig -> Process (Raft a)
+startRaft :: RaftConfig -> Process (Raft String)
 startRaft cfg = do
-  st <- liftIO $ newTVarIO (initRaftState :: RaftState a)
+  st <- liftIO $ newTVarIO (initRaftState (show . utctDayTime <$> getCurrentTime))
   fmap Raft . spawnLocal $ do
     self <- getSelfPid
     register raftServerName self
@@ -59,7 +60,7 @@ data AppendEntriesReq a = AppendEntriesReq
   , areqLeaderId     :: NodeId
   , areqPrevLogIndex :: Int
   , areqPrevLogTerm  :: Term
-  , areqEntries      :: [a]
+  , areqEntries      :: [((Term, Int), a)]
   , areqLeaderCommit :: Int
   } deriving (Show, Generic, Typeable)
 
@@ -112,27 +113,26 @@ data RaftConfig = RaftConfig
   }
 
 data RaftState a = RaftState
-  { pendingRpc      :: M.Map Int (UTCTime, RaftRequest a)
-  , rpcCounter      :: Int
-  , currentTerm     :: Term
-  , currentLog      :: [((Term, Int), a)]
-  , commitIndex     :: Int
-  , lastApplied     :: Int
-  , nextIndex       :: M.Map NodeId Int
-  , matchIndex      :: M.Map NodeId Int
+  { pendingRpc      :: !(M.Map Int (UTCTime, RaftRequest a))
+  , rpcCounter      :: !Int
+  , currentTerm     :: !Term
+  , currentLog      :: ![((Term, Int), a)]
+  , commitIndex     :: !Int
+  , nextIndex       :: !(M.Map NodeId Int)
+  , matchIndex      :: !(M.Map NodeId Int)
+  , debugElement    :: !(IO a)
   }
 
-initRaftState :: RaftState a
-initRaftState = RaftState
+initRaftState :: IO a -> RaftState a
+initRaftState a = RaftState
   { pendingRpc   = M.empty
   , rpcCounter   = 0
   , currentTerm  = 0
   , currentLog   = []
   , commitIndex  = 0
-  , lastApplied  = 0
   , nextIndex    = M.empty
   , matchIndex   = M.empty
-
+  , debugElement = a
   }
 
 getLastLogItem :: RaftState a -> (Term, Int)
@@ -169,7 +169,7 @@ lookupRpc st reqId =
 ----------------------------------------------------------------------
 -- Behaviors
 
-leader :: (Serializable a) => RaftConfig -> TVar (RaftState a) -> Process ()
+leader :: (Show a, Serializable a) => RaftConfig -> TVar (RaftState a) -> Process ()
 leader cfg@RaftConfig{..} st = do
   term <- peeks st currentTerm
   say $ "Became leader of term " ++ show term
@@ -179,7 +179,8 @@ leader cfg@RaftConfig{..} st = do
 
   liftIO $ atomically $ do
     modifyTVar st $ \s ->
-      s { nextIndex  = M.fromList  $ map (\node -> (node, lastApplied s)) otherPeers
+      let (_, lastLogIndex) = getLastLogItem s in
+      s { nextIndex  = M.fromList $ map (\node -> (node, lastLogIndex)) otherPeers
         , matchIndex = M.fromList $ map (\node -> (node, 0)) otherPeers
         }
 
@@ -190,8 +191,22 @@ leader cfg@RaftConfig{..} st = do
       mapM (sendHeartbeat st) peers
       liftIO $ threadDelay (heartbeatRate * 1000)
 
+  -- Add some messages for debug
+  addMessages <- spawnLocal $ do
+    link self
+    forever $ do
+      say $ "New element!"
+      el' <- peeks st debugElement
+      el <- liftIO el'
+      pokes st $ \s ->
+        let (_, lastLogIndex) = getLastLogItem s in
+        s { currentLog = ((currentTerm s , succ lastLogIndex), el) : currentLog s
+          }
+      liftIO $ threadDelay (heartbeatRate * 5100)
+
   newRole <- collectCommits
   exit heartbeat ()
+  exit addMessages ()
 
   case newRole of
     Leader -> leader cfg st
@@ -204,7 +219,7 @@ leader cfg@RaftConfig{..} st = do
       leaderId <- getSelfNode
       commit <- receiveWait
         [ match $ \commit@AppendEntriesResp{..} -> do
-            (_, _) <- checkCommit commit st
+            (_, _) <- checkCommit commit st peers
             return Nothing
 
         , match $ \req@AppendEntriesReq{..} -> do
@@ -219,7 +234,7 @@ leader cfg@RaftConfig{..} st = do
               then return (Just (FollowerOf vreqCandidateId))
               else return Nothing
 
-        , matchUnknown (return Nothing)
+        , matchUnknown (say "Unknown message" >> return Nothing)
         ]
       case commit of
         Nothing -> collectCommits
@@ -227,7 +242,7 @@ leader cfg@RaftConfig{..} st = do
 
 
 
-candidate :: (Serializable a) => RaftConfig -> TVar (RaftState a) -> Process ()
+candidate :: (Show a, Serializable a) => RaftConfig -> TVar (RaftState a) -> Process ()
 candidate cfg@RaftConfig{..} st = do
   term <- peeks st currentTerm
   say $ "Became candidate of term " ++ show term
@@ -283,7 +298,7 @@ candidate cfg@RaftConfig{..} st = do
 
 
 
-follower :: (Serializable a) => RaftConfig -> TVar (RaftState a) -> Maybe NodeId -> Process ()
+follower :: (Show a, Serializable a) => RaftConfig -> TVar (RaftState a) -> Maybe NodeId -> Process ()
 follower cfg@RaftConfig{..} st votedFor = do
   currentElectionTimeout <- randomElectionTimeout (electionTimeout * 1000)
   res <- receiveTimeout currentElectionTimeout
@@ -298,6 +313,8 @@ follower cfg@RaftConfig{..} st votedFor = do
         if success
           then return (Just vreqCandidateId)
           else return votedFor
+
+    , matchUnknown (say "Unknown message" >> return votedFor)
     ]
   case res of
     Nothing -> candidate cfg st
@@ -351,66 +368,76 @@ voteFor RequestVoteReq{..} st votedFor = do
   return (vreqCandidateId, granted)
 
 checkVote :: RequestVoteResp -> TVar (RaftState a) -> Process (NodeId, Bool)
-checkVote r@RequestVoteResp{..} st = do
-  say $ "Checking vote: " ++ show r
+checkVote RequestVoteResp{..} st = do
   pokes st $ \s -> s { currentTerm = max vrespTerm (currentTerm s) }
   req <- lookupRpc st vrespRequestId
   case req of
     Nothing ->
       return (vrespNodeId, False)
     Just _  -> do
+      if vrespVoteGranted
+        then say "Vote granted"
+        else say "Vote not granted"
       return (vrespNodeId, vrespVoteGranted)
 
 -- * Log replication
 
-sendHeartbeat :: (Serializable a) => TVar (RaftState a) -> NodeId -> Process ()
+sendHeartbeat :: (Show a, Serializable a) => TVar (RaftState a) -> NodeId -> Process ()
 sendHeartbeat st node = do
   say $ "Heartbeat to " ++ show node
-  term <- peeks st currentTerm
   leaderId <- getSelfNode
-  leaderCommit <- peeks st commitIndex
-  log <- peeks st currentLog
+  RaftState{..} <- peeks st id
+
+  let currentNextIndex = M.findWithDefault 0 node nextIndex
+
+  let (entriesToSend, restEntries) = partition (\((_, n), _) -> n >= currentNextIndex) currentLog
+      (prevLogTerm, prevLogIndex)  = foldr (\(idx, _) _ -> idx) (0, 0) restEntries
+
+  -- say $ "Presumed state on " ++ show node ++ ": curNextIndex=" ++ show currentNextIndex ++"\n" ++ show restEntries
 
   request <- issueRpc st AppendEntriesRPC $ \reqid ->
     AppendEntriesReq
       { areqRequestId    = reqid
-      , areqTerm         = term
+      , areqTerm         = currentTerm
       , areqLeaderId     = leaderId
-      , areqPrevLogIndex = 0
-      , areqPrevLogTerm  = 0
-      , areqEntries      = map snd $ take 0 log
-      , areqLeaderCommit = leaderCommit
+      , areqPrevLogIndex = prevLogIndex
+      , areqPrevLogTerm  = prevLogTerm
+      , areqEntries      = entriesToSend
+      , areqLeaderCommit = commitIndex
       }
 
   sendNode node request
 
-appendEntries :: AppendEntriesReq a -> TVar (RaftState a) -> Maybe NodeId -> Process (NodeId, Bool)
-appendEntries AppendEntriesReq{..} st votedFor = do
-  say $ "Heartbeat from leader " ++ show areqLeaderId
+appendEntries :: (Show a) => AppendEntriesReq a -> TVar (RaftState a) -> Maybe NodeId -> Process (NodeId, Bool)
+appendEntries _r@AppendEntriesReq{..} st votedFor = do
+  coords <- peeks st getLastLogItem
 
   success <- liftIO $ atomically $ do
     s <- readTVar st
-    let legitimate =
+    let legitimateLeader =
           areqTerm > (currentTerm s) ||
           areqTerm == (currentTerm s) && votedFor == Just areqLeaderId
 
         (lastLogTerm, lastLogIndex) = getLastLogItem s
 
-        canAppend =
-          areqPrevLogTerm == lastLogTerm  &&
-          areqPrevLogIndex == lastLogIndex
+        canAppendEntries =
+          areqPrevLogTerm  <= lastLogTerm  &&
+          areqPrevLogIndex <= lastLogIndex
 
-        newEntries = zip (zip (repeat areqTerm) [lastLogIndex..]) areqEntries
-
-    if legitimate && canAppend
+    if legitimateLeader && canAppendEntries
       then do
         modifyTVar st $ \s ->
           s { currentTerm = max areqTerm (currentTerm s)
-            , currentLog = reverse newEntries ++ currentLog s
+            , currentLog  = areqEntries ++ dropWhile (\((_, n), _) -> n > areqPrevLogIndex) (currentLog s)
+            , commitIndex = areqLeaderCommit
             }
         return True
       else
         return False
+
+  coords' <- peeks st getLastLogItem
+
+  say $ "Heartbeat from " ++ show areqLeaderId ++ ": " ++ show coords ++ " -> " ++ show coords'
 
   self <- getSelfNode
   newTerm <- peeks st currentTerm
@@ -423,31 +450,53 @@ appendEntries AppendEntriesReq{..} st votedFor = do
 
   return (areqLeaderId, success)
 
-checkCommit :: AppendEntriesResp -> TVar (RaftState a) -> Process (NodeId, Bool)
-checkCommit AppendEntriesResp{..} st = do
+checkCommit :: AppendEntriesResp -> TVar (RaftState a) -> [NodeId] -> Process (NodeId, Bool)
+checkCommit AppendEntriesResp{..} st peers = do
+  request <- lookupRpc st arespRequestId
+  leaderId <- getSelfNode
+  let quorum = quorumCount leaderId peers - 1
 
-  liftIO $ atomically $ do
-    let modifyNextIndex idx =
-          if arespSuccess
-          then idx
-          else pred idx
+  success <- case request of
+    Just (AppendEntriesRPC req) -> do
+      liftIO $ atomically $ do
+        let lastAppliedIndex :: Maybe Int
+            lastAppliedIndex = snd . fst <$> listToMaybe (areqEntries req)
 
-        modifyMatchIndex _idx =
-          if arespSuccess
-          then undefined
-          else undefined
+            modifyNextIndex idx =
+              if arespSuccess
+              then maybe idx succ lastAppliedIndex
+              else max 0 (pred idx)
 
-    modifyTVar st $ \s ->
-      s { nextIndex  = M.adjust modifyNextIndex arespNodeId (nextIndex s)
-        , matchIndex = M.adjust modifyMatchIndex arespNodeId (matchIndex s)
-        , currentTerm = max arespTerm (currentTerm s)
-        }
+            modifyMatchIndex idx =
+              if arespSuccess
+              then fromMaybe idx lastAppliedIndex
+              else idx
 
-  if arespSuccess
-    then say "Successful append from follower"
+        modifyTVar' st $ \s ->
+          let
+            newNextIndex  = M.adjust modifyNextIndex arespNodeId (nextIndex s)
+            newMatchIndex = M.adjust modifyMatchIndex arespNodeId (matchIndex s)
+            quorumCommitIndex =
+              max
+                (commitIndex s)
+                (last . take quorum . sortBy (\b a -> a `compare` b) . M.elems $ newMatchIndex)
+
+          in s { nextIndex  = newNextIndex
+               , matchIndex = newMatchIndex
+               , commitIndex = quorumCommitIndex
+               }
+
+        return arespSuccess
+    Just  _ -> return False
+    Nothing -> return False
+
+  commit <- peeks st commitIndex
+
+  if success
+    then say $ "Successful append from follower, new commit: " ++ show commit
     else say "Unsuccessful append from follower"
+  return (arespNodeId, success)
 
-  return (arespNodeId, arespSuccess)
 
 ----------------------------------------------------------------------
 -- Utils
