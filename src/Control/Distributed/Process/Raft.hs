@@ -5,8 +5,8 @@
 
 module Control.Distributed.Process.Raft
   ( startRaft
-  , addToLog
-  , getLog
+  , commit
+  , retrieve
   , RaftConfig(..)
   , Raft
   ) where
@@ -35,24 +35,43 @@ import GHC.Generics
 
 data Raft a = Raft ProcessId
 
-startRaft :: RaftConfig -> Process (Raft String)
+startRaft :: forall a. (Show a, Serializable a) => RaftConfig -> Process (Raft a)
 startRaft cfg = do
-  st <- liftIO $ newTVarIO (initRaftState (show . utctDayTime <$> getCurrentTime))
+  st <- liftIO $ newTVarIO (initRaftState :: RaftState a)
   fmap Raft . spawnLocal $ do
     self <- getSelfPid
     register raftServerName self
     follower cfg st Nothing
 
-addToLog :: Raft a -> a -> Process ()
-addToLog _ _ = return ()
+commit :: forall a. (Serializable a) => Raft a -> a -> Process ()
+commit (Raft pid) payload = do
+  self <- getSelfPid
+  send pid ClientCommitReq
+    { creqClientPID = self
+    , creqPayload = Just payload
+    , creqRequestLog = False
+    }
+  (_ :: ClientCommitResp a) <- expect
+  return ()
 
-getLog :: Raft a -> Process [a]
-getLog _ = return []
+retrieve :: forall a. (Serializable a) => Raft a -> Process [a]
+retrieve (Raft pid) = do
+  self <- getSelfPid
+  send pid ClientCommitReq
+    { creqClientPID = self
+    , creqPayload = (Nothing :: Maybe a)
+    , creqRequestLog = True
+    }
+  ClientCommitResp{..} <- expect
+  return $ fromMaybe [] crespLog
 
 ----------------------------------------------------------------------
 -- RPC data types
 
-type Term = Int
+newtype Term = Term Int
+  deriving (Eq, Ord, Show, Generic, Typeable)
+
+instance Binary Term
 
 data AppendEntriesReq a = AppendEntriesReq
   { areqRequestId    :: Int
@@ -64,7 +83,7 @@ data AppendEntriesReq a = AppendEntriesReq
   , areqLeaderCommit :: Int
   } deriving (Show, Generic, Typeable)
 
-instance Binary a => Binary (AppendEntriesReq a)
+instance (Binary a) => Binary (AppendEntriesReq a)
 
 data AppendEntriesResp = AppendEntriesResp
   { arespRequestId   :: Int
@@ -80,7 +99,7 @@ data RequestVoteReq = RequestVoteReq
   , vreqTerm         :: Term
   , vreqCandidateId  :: NodeId
   , vreqLastLogIndex :: Int
-  , vreqLastLogTerm  :: Int
+  , vreqLastLogTerm  :: Term
   } deriving (Show, Generic, Typeable)
 
 instance Binary RequestVoteReq
@@ -93,6 +112,22 @@ data RequestVoteResp = RequestVoteResp
   } deriving (Show, Generic, Typeable)
 
 instance Binary RequestVoteResp
+
+data ClientCommitReq a = ClientCommitReq
+  { creqClientPID    :: ProcessId
+  , creqPayload      :: Maybe a
+  , creqRequestLog   :: Bool
+  } deriving (Show, Generic, Typeable)
+
+instance (Binary a) => Binary (ClientCommitReq a)
+
+data ClientCommitResp a = ClientCommitResp
+  { crespLog         :: Maybe [a]
+  , crespCommitIndex :: Int
+  , crespSuccess     :: Bool
+  } deriving (Show, Generic, Typeable)
+
+instance (Binary a) => Binary (ClientCommitResp a)
 
 data RaftRequest a
   = AppendEntriesRPC (AppendEntriesReq a)
@@ -120,23 +155,23 @@ data RaftState a = RaftState
   , commitIndex     :: !Int
   , nextIndex       :: !(M.Map NodeId Int)
   , matchIndex      :: !(M.Map NodeId Int)
-  , debugElement    :: !(IO a)
+  , clientQueue     :: !(M.Map Int (Process ()))
   }
 
-initRaftState :: IO a -> RaftState a
-initRaftState a = RaftState
+initRaftState :: RaftState a
+initRaftState = RaftState
   { pendingRpc   = M.empty
   , rpcCounter   = 0
-  , currentTerm  = 0
+  , currentTerm  = Term 0
   , currentLog   = []
   , commitIndex  = 0
   , nextIndex    = M.empty
   , matchIndex   = M.empty
-  , debugElement = a
+  , clientQueue  = M.empty
   }
 
 getLastLogItem :: RaftState a -> (Term, Int)
-getLastLogItem = foldr (\(coords, _) _-> coords) (0, 0) . currentLog
+getLastLogItem = foldr (\(coords, _) _-> coords) (Term 0, 0) . currentLog
 
 peeks :: TVar a -> (a -> b) -> Process b
 peeks st f = f <$> liftIO (atomically (readTVar st))
@@ -180,8 +215,9 @@ leader cfg@RaftConfig{..} st = do
   liftIO $ atomically $ do
     modifyTVar st $ \s ->
       let (_, lastLogIndex) = getLastLogItem s in
-      s { nextIndex  = M.fromList $ map (\node -> (node, lastLogIndex)) otherPeers
-        , matchIndex = M.fromList $ map (\node -> (node, 0)) otherPeers
+      s { nextIndex   = M.fromList $ map (\node -> (node, lastLogIndex)) otherPeers
+        , matchIndex  = M.fromList $ map (\node -> (node, 0)) otherPeers
+        , clientQueue = M.empty
         }
 
   self <- getSelfPid
@@ -191,22 +227,8 @@ leader cfg@RaftConfig{..} st = do
       mapM (sendHeartbeat st) peers
       liftIO $ threadDelay (heartbeatRate * 1000)
 
-  -- Add some messages for debug
-  addMessages <- spawnLocal $ do
-    link self
-    forever $ do
-      say $ "New element!"
-      el' <- peeks st debugElement
-      el <- liftIO el'
-      pokes st $ \s ->
-        let (_, lastLogIndex) = getLastLogItem s in
-        s { currentLog = ((currentTerm s , succ lastLogIndex), el) : currentLog s
-          }
-      liftIO $ threadDelay (heartbeatRate * 5100)
-
   newRole <- collectCommits
   exit heartbeat ()
-  exit addMessages ()
 
   case newRole of
     Leader -> leader cfg st
@@ -234,6 +256,10 @@ leader cfg@RaftConfig{..} st = do
               then return (Just (FollowerOf vreqCandidateId))
               else return Nothing
 
+        , match $ \req@ClientCommitReq{..} -> do
+            clientCommit req st (Just leaderId)
+            return Nothing
+
         , matchUnknown (say "Unknown message" >> return Nothing)
         ]
       case commit of
@@ -248,7 +274,7 @@ candidate cfg@RaftConfig{..} st = do
   say $ "Became candidate of term " ++ show term
 
   currentElectionTimeout <- randomElectionTimeout (electionTimeout * 1000)
-  pokes st $ \s -> s { currentTerm = succ (currentTerm s) }
+  pokes st $ \s -> s { currentTerm = let Term n = currentTerm s in Term (succ n) }
   reminder <- remindAfter currentElectionTimeout ()
 
   startElection st peers
@@ -289,8 +315,6 @@ candidate cfg@RaftConfig{..} st = do
 
         , match $ \(Reminder ()) -> do
             return (Left Candidate)
-
-        , matchUnknown (say "Unknown message" >> return (Right n))
         ]
       case vote of
         Left newRole -> return newRole
@@ -313,6 +337,10 @@ follower cfg@RaftConfig{..} st votedFor = do
         if success
           then return (Just vreqCandidateId)
           else return votedFor
+
+    , match $ \req@ClientCommitReq{..} -> do
+        clientCommit req st votedFor
+        return votedFor
 
     , matchUnknown (say "Unknown message" >> return votedFor)
     ]
@@ -391,7 +419,7 @@ sendHeartbeat st node = do
   let currentNextIndex = M.findWithDefault 0 node nextIndex
 
   let (entriesToSend, restEntries) = partition (\((_, n), _) -> n >= currentNextIndex) currentLog
-      (prevLogTerm, prevLogIndex)  = foldr (\(idx, _) _ -> idx) (0, 0) restEntries
+      (prevLogTerm, prevLogIndex)  = foldr (\(idx, _) _ -> idx) (Term 0, 0) restEntries
 
   -- say $ "Presumed state on " ++ show node ++ ": curNextIndex=" ++ show currentNextIndex ++"\n" ++ show restEntries
 
@@ -496,6 +524,51 @@ checkCommit AppendEntriesResp{..} st peers = do
     then say $ "Successful append from follower, new commit: " ++ show commit
     else say "Unsuccessful append from follower"
   return (arespNodeId, success)
+
+-- * Client
+
+clientCommit :: forall a. (Serializable a) => ClientCommitReq a -> TVar (RaftState a) -> Maybe NodeId -> Process ()
+clientCommit req@ClientCommitReq{..} st leaderId = do
+  iamleader <- (== leaderId) . Just <$> getSelfNode
+  case creqPayload of
+    Nothing -> respondWithLog
+    Just el
+      | iamleader -> appendToClientQueue el respondWithLog
+      | otherwise -> sendToLeader
+
+  where
+    appendToClientQueue :: a -> Process () -> Process ()
+    appendToClientQueue element action = do
+      liftIO $ atomically $ do
+        newLogIndex <- succ . snd . getLastLogItem <$> readTVar st
+        modifyTVar' st $ \s ->
+          s { currentLog = ((currentTerm s, newLogIndex), element) : currentLog s
+            , clientQueue = M.insert newLogIndex action (clientQueue s)
+            }
+
+    respondWithLog = do
+      s <- peeks st id
+      send creqClientPID ClientCommitResp
+        { crespLog = if creqRequestLog
+                     then Just . reverse . map snd .
+                          dropWhile (\((_, n), _) -> n > commitIndex s) $
+                          currentLog s
+                     else Nothing
+        , crespCommitIndex = commitIndex s
+        , crespSuccess     = True
+        }
+
+    sendToLeader = do
+      case leaderId of
+        Nothing ->
+          send creqClientPID ClientCommitResp
+            { crespLog = (Nothing :: Maybe [a])
+            , crespCommitIndex = 0
+            , crespSuccess = False
+            }
+        Just node -> sendNode node req
+
+
 
 
 ----------------------------------------------------------------------
