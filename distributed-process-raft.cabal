@@ -17,6 +17,14 @@ library
   hs-source-dirs:      src
   ghc-options:         -Wall -fno-warn-name-shadowing -fno-warn-unused-do-bind
   exposed-modules:     Control.Distributed.Process.Raft
+                       Control.Distributed.Process.Reminder
+  other-modules:       Control.Distributed.Process.Raft.Types
+                       Control.Distributed.Process.Raft.Roles
+                       Control.Distributed.Process.Raft.AppendEntriesRpc
+                       Control.Distributed.Process.Raft.RequestVoteRpc
+                       Control.Distributed.Process.Raft.ClientRpc
+                       Control.Distributed.Process.Raft.Utils
+
   default-language:    Haskell2010
   build-depends:
     base >= 4.7 && < 5, distributed-process, containers, random, mtl,
