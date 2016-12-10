@@ -35,6 +35,13 @@ import GHC.Generics
 
 data Raft a = Raft ProcessId (TVar Int)
 
+data RaftConfig = RaftConfig
+  { electionTimeout :: Int      -- ^ Election timeout in milliseconds
+  , heartbeatRate   :: Int      -- ^ Heartbeat rate in milliseconds
+  , peers           :: [NodeId] -- ^ Known peers
+  }
+
+-- | Start Raft consensus server
 startRaft :: forall a. (Show a, Serializable a) => RaftConfig -> Process (Raft a)
 startRaft cfg = do
   st <- liftIO $ newTVarIO (initRaftState :: RaftState a)
@@ -47,6 +54,7 @@ startRaft cfg = do
 
   return $ Raft pid reqCounter
 
+-- | Propose an entry into log. Synchronous. Might timeout after 60 seconds or be rejected.
 commit :: forall a. (Serializable a) => Raft a -> a -> Process Bool
 commit (Raft pid counter) payload = do
   self <- getSelfPid
@@ -67,6 +75,8 @@ commit (Raft pid counter) payload = do
     ]
   return $ fromMaybe False success
 
+
+-- | Retrieve committed log. Synchronous. Timeout: 60 seconds.
 retrieve :: forall a. (Serializable a) => Raft a -> Process (Maybe [a])
 retrieve (Raft pid counter) = do
   self <- getSelfPid
@@ -163,12 +173,6 @@ data Role
   = FollowerOf NodeId
   | Candidate
   | Leader
-
-data RaftConfig = RaftConfig
-  { electionTimeout :: Int -- milliseconds
-  , heartbeatRate   :: Int -- milliseconds
-  , peers           :: [NodeId]
-  }
 
 data RaftState a = RaftState
   { pendingRpc      :: !(M.Map Int (UTCTime, RaftRequest a))
