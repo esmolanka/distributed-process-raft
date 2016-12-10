@@ -33,37 +33,58 @@ import GHC.Generics
 ----------------------------------------------------------------------
 -- Interface
 
-data Raft a = Raft ProcessId
+data Raft a = Raft ProcessId (TVar Int)
 
 startRaft :: forall a. (Show a, Serializable a) => RaftConfig -> Process (Raft a)
 startRaft cfg = do
   st <- liftIO $ newTVarIO (initRaftState :: RaftState a)
-  fmap Raft . spawnLocal $ do
+  reqCounter <- liftIO $ newTVarIO 0
+
+  pid <- spawnLocal $ do
     self <- getSelfPid
     register raftServerName self
     follower cfg st Nothing
 
-commit :: forall a. (Serializable a) => Raft a -> a -> Process ()
-commit (Raft pid) payload = do
+  return $ Raft pid reqCounter
+
+commit :: forall a. (Serializable a) => Raft a -> a -> Process Bool
+commit (Raft pid counter) payload = do
   self <- getSelfPid
+  reqid <- liftIO $ atomically $ do
+    modifyTVar' counter succ
+    readTVar counter
+
   send pid ClientCommitReq
-    { creqClientPID = self
+    { creqRequestId = reqid
+    , creqClientPid = self
     , creqPayload = Just payload
     , creqRequestLog = False
     }
-  (_ :: ClientCommitResp a) <- expect
-  return ()
 
-retrieve :: forall a. (Serializable a) => Raft a -> Process [a]
-retrieve (Raft pid) = do
+  success <- receiveTimeout (60 * 1000000)
+    [ matchIf ((== reqid) . crespRequestId) $ \(r :: ClientCommitResp a) ->
+        return . crespSuccess $ r
+    ]
+  return $ fromMaybe False success
+
+retrieve :: forall a. (Serializable a) => Raft a -> Process (Maybe [a])
+retrieve (Raft pid counter) = do
   self <- getSelfPid
+  reqid <- liftIO $ atomically $ do
+    modifyTVar' counter succ
+    readTVar counter
+
   send pid ClientCommitReq
-    { creqClientPID = self
+    { creqRequestId = reqid
+    , creqClientPid = self
     , creqPayload = (Nothing :: Maybe a)
     , creqRequestLog = True
     }
-  ClientCommitResp{..} <- expect
-  return $ fromMaybe [] crespLog
+
+  fmap join $ receiveTimeout (60 * 1000000)
+    [ matchIf ((== reqid) . crespRequestId) $ \(r :: ClientCommitResp a) ->
+        return . crespLog $ r
+    ]
 
 ----------------------------------------------------------------------
 -- RPC data types
@@ -114,7 +135,8 @@ data RequestVoteResp = RequestVoteResp
 instance Binary RequestVoteResp
 
 data ClientCommitReq a = ClientCommitReq
-  { creqClientPID    :: ProcessId
+  { creqRequestId    :: Int
+  , creqClientPid    :: ProcessId
   , creqPayload      :: Maybe a
   , creqRequestLog   :: Bool
   } deriving (Show, Generic, Typeable)
@@ -122,7 +144,8 @@ data ClientCommitReq a = ClientCommitReq
 instance (Binary a) => Binary (ClientCommitReq a)
 
 data ClientCommitResp a = ClientCommitResp
-  { crespLog         :: Maybe [a]
+  { crespRequestId   :: Int
+  , crespLog         :: Maybe [a]
   , crespCommitIndex :: Int
   , crespSuccess     :: Bool
   } deriving (Show, Generic, Typeable)
@@ -155,7 +178,7 @@ data RaftState a = RaftState
   , commitIndex     :: !Int
   , nextIndex       :: !(M.Map NodeId Int)
   , matchIndex      :: !(M.Map NodeId Int)
-  , clientQueue     :: !(M.Map Int (Process ()))
+  , clientQueue     :: !(M.Map Int [Process ()])
   }
 
 initRaftState :: RaftState a
@@ -200,6 +223,14 @@ lookupRpc st reqId =
     req <- M.lookup reqId . pendingRpc <$> readTVar st
     modifyTVar' st (\s -> s { pendingRpc = M.delete reqId (pendingRpc s) })
     return $ fmap snd req
+
+lookupClients :: TVar (RaftState a) -> Process [Process ()]
+lookupClients st =
+  liftIO $ atomically $ do
+    RaftState{..} <- readTVar st
+    let (ready, retained) = M.partitionWithKey (\k _ -> k <= commitIndex) clientQueue
+    modifyTVar' st (\s -> s { clientQueue = retained })
+    return $ concat $ M.elems ready
 
 ----------------------------------------------------------------------
 -- Behaviors
@@ -312,6 +343,10 @@ candidate cfg@RaftConfig{..} st = do
             if success
               then return (Left (FollowerOf (areqLeaderId req)))
               else return (Right n)
+
+        , matchIf (isNothing . creqPayload) $ \req@ClientCommitReq{..} -> do
+            clientCommit req st Nothing
+            return (Right n)
 
         , match $ \(Reminder ()) -> do
             return (Left Candidate)
@@ -514,11 +549,13 @@ checkCommit AppendEntriesResp{..} st peers = do
                , commitIndex = quorumCommitIndex
                }
 
-        return arespSuccess
+        return (arespSuccess)
     Just  _ -> return False
     Nothing -> return False
 
   commit <- peeks st commitIndex
+
+  lookupClients st >>= sequence
 
   if success
     then say $ "Successful append from follower, new commit: " ++ show commit
@@ -543,13 +580,14 @@ clientCommit req@ClientCommitReq{..} st leaderId = do
         newLogIndex <- succ . snd . getLastLogItem <$> readTVar st
         modifyTVar' st $ \s ->
           s { currentLog = ((currentTerm s, newLogIndex), element) : currentLog s
-            , clientQueue = M.insert newLogIndex action (clientQueue s)
+            , clientQueue = M.insertWith (++) newLogIndex [action] (clientQueue s)
             }
 
     respondWithLog = do
       s <- peeks st id
-      send creqClientPID ClientCommitResp
-        { crespLog = if creqRequestLog
+      send creqClientPid ClientCommitResp
+        { crespRequestId = creqRequestId
+        , crespLog = if creqRequestLog
                      then Just . reverse . map snd .
                           dropWhile (\((_, n), _) -> n > commitIndex s) $
                           currentLog s
@@ -561,8 +599,9 @@ clientCommit req@ClientCommitReq{..} st leaderId = do
     sendToLeader = do
       case leaderId of
         Nothing ->
-          send creqClientPID ClientCommitResp
-            { crespLog = (Nothing :: Maybe [a])
+          send creqClientPid ClientCommitResp
+            { crespRequestId = creqRequestId
+            , crespLog = (Nothing :: Maybe [a])
             , crespCommitIndex = 0
             , crespSuccess = False
             }
