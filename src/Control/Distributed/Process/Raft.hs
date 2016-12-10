@@ -25,6 +25,7 @@ import Data.Maybe
 import Data.Binary (Binary)
 import qualified Data.Map.Strict as M
 import Data.Typeable
+import Data.Time
 
 import GHC.Generics
 
@@ -48,12 +49,13 @@ getLog :: Raft a -> Process [a]
 getLog _ = return []
 
 ----------------------------------------------------------------------
--- RPC
+-- RPC data types
 
 type Term = Int
 
 data AppendEntriesReq a = AppendEntriesReq
-  { areqTerm         :: Term
+  { areqRequestId    :: Int
+  , areqTerm         :: Term
   , areqLeaderId     :: NodeId
   , areqPrevLogIndex :: Int
   , areqPrevLogTerm  :: Term
@@ -64,15 +66,18 @@ data AppendEntriesReq a = AppendEntriesReq
 instance Binary a => Binary (AppendEntriesReq a)
 
 data AppendEntriesResp = AppendEntriesResp
-  { arespTerm    :: Term
-  , arespSuccess :: Bool
+  { arespRequestId   :: Int
+  , arespTerm        :: Term
+  , arespNodeId      :: NodeId
+  , arespSuccess     :: Bool
   } deriving (Show, Generic, Typeable)
 
 instance Binary AppendEntriesResp
 
 data RequestVoteReq = RequestVoteReq
-  { vreqTerm         :: Term -- candidate's term
-  , vreqCandidateId  :: NodeId -- candidate requesting vote
+  { vreqRequestId    :: Int
+  , vreqTerm         :: Term
+  , vreqCandidateId  :: NodeId
   , vreqLastLogIndex :: Int
   , vreqLastLogTerm  :: Int
   } deriving (Show, Generic, Typeable)
@@ -80,14 +85,20 @@ data RequestVoteReq = RequestVoteReq
 instance Binary RequestVoteReq
 
 data RequestVoteResp = RequestVoteResp
-  { vrespTerm        :: Term
+  { vrespRequestId   :: Int
+  , vrespTerm        :: Term
+  , vrespNodeId      :: NodeId
   , vrespVoteGranted :: Bool
   } deriving (Show, Generic, Typeable)
 
 instance Binary RequestVoteResp
 
+data RaftRequest a
+  = AppendEntriesRPC (AppendEntriesReq a)
+  | RequestVoteRPC RequestVoteReq
+
 ----------------------------------------------------------------------
--- States
+-- State
 
 data Role
   = FollowerOf NodeId
@@ -101,7 +112,9 @@ data RaftConfig = RaftConfig
   }
 
 data RaftState a = RaftState
-  { currentTerm     :: Term
+  { pendingRpc      :: M.Map Int (UTCTime, RaftRequest a)
+  , rpcCounter      :: Int
+  , currentTerm     :: Term
   , currentLog      :: [((Term, Int), a)]
   , commitIndex     :: Int
   , lastApplied     :: Int
@@ -111,7 +124,9 @@ data RaftState a = RaftState
 
 initRaftState :: RaftState a
 initRaftState = RaftState
-  { currentTerm  = 0
+  { pendingRpc   = M.empty
+  , rpcCounter   = 0
+  , currentTerm  = 0
   , currentLog   = []
   , commitIndex  = 0
   , lastApplied  = 0
@@ -120,13 +135,39 @@ initRaftState = RaftState
 
   }
 
+getLastLogItem :: RaftState a -> (Term, Int)
+getLastLogItem = foldr (\(coords, _) _-> coords) (0, 0) . currentLog
+
 peeks :: TVar a -> (a -> b) -> Process b
 peeks st f = f <$> liftIO (atomically (readTVar st))
 
 pokes :: TVar a -> (a -> a) -> Process ()
-pokes st f = liftIO (atomically (modifyTVar st f))
+pokes st f = liftIO (atomically (modifyTVar' st f))
 
+issueRpc  :: TVar (RaftState a) -> (r -> RaftRequest a) -> (Int -> r) -> Process r
+issueRpc st wrap mkReq = do
+  now <- liftIO $ getCurrentTime
+  liftIO $ atomically $ do
+    reqid <- rpcCounter <$> readTVar st
+    let request = mkReq reqid
+    modifyTVar' st $ \s ->
+      s { rpcCounter = succ (rpcCounter s)
+        , pendingRpc = M.insert (rpcCounter s) (now, wrap request) (M.filter (onlyNew now) (pendingRpc s))
+        }
+    return request
+  where
+    onlyNew :: UTCTime -> (UTCTime, a) -> Bool
+    onlyNew now (timestamp, _) = now `diffUTCTime` timestamp < 60
 
+lookupRpc :: TVar (RaftState a) -> Int -> Process (Maybe (RaftRequest a))
+lookupRpc st reqId =
+  liftIO $ atomically $ do
+    req <- M.lookup reqId . pendingRpc <$> readTVar st
+    modifyTVar' st (\s -> s { pendingRpc = M.delete reqId (pendingRpc s) })
+    return $ fmap snd req
+
+----------------------------------------------------------------------
+-- Behaviors
 
 leader :: (Serializable a) => RaftConfig -> TVar (RaftState a) -> Process ()
 leader cfg@RaftConfig{..} st = do
@@ -163,17 +204,17 @@ leader cfg@RaftConfig{..} st = do
       leaderId <- getSelfNode
       commit <- receiveWait
         [ match $ \commit@AppendEntriesResp{..} -> do
-            checkCommit commit st
+            (_, _) <- checkCommit commit st
             return Nothing
 
         , match $ \req@AppendEntriesReq{..} -> do
-            success <- appendEntries req st (Just leaderId)
+            (_, success) <- appendEntries req st (Just leaderId)
             if success
               then return (Just (FollowerOf areqLeaderId))
               else return Nothing
 
         , match $ \req@RequestVoteReq{..} -> do
-            success <- voteFor req st (Just leaderId)
+            (_, success) <- voteFor req st (Just leaderId)
             if success
               then return (Just (FollowerOf vreqCandidateId))
               else return Nothing
@@ -192,32 +233,12 @@ candidate cfg@RaftConfig{..} st = do
   say $ "Became candidate of term " ++ show term
 
   currentElectionTimeout <- randomElectionTimeout (electionTimeout * 1000)
-
-  candidateId <- getSelfNode
-  snapshot    <- liftIO $ atomically $ do
-    modifyTVar st $ \s ->
-      s { currentTerm = succ (currentTerm s)
-        }
-    readTVar st
-
-  let (lastLogTerm, lastLogIndex) =
-        case currentLog snapshot of
-          [] -> (0, 0)
-          (coords, _) : _ -> coords
-
-  let voterequest = RequestVoteReq
-        { vreqTerm         = currentTerm snapshot
-        , vreqCandidateId  = candidateId
-        , vreqLastLogIndex = lastLogIndex
-        , vreqLastLogTerm  = lastLogTerm
-        }
-
+  pokes st $ \s -> s { currentTerm = succ (currentTerm s) }
   reminder <- remindAfter currentElectionTimeout ()
 
-  let otherPeers = filter (/= candidateId) peers
+  startElection st peers
 
-  -- Send voting requests
-  mapM (\peer -> sendNode peer voterequest) otherPeers
+  candidateId <- getSelfNode
 
   -- Collect votes from quorum - 1 (voted for self)
   newRole <- collectVotes (quorumCount candidateId peers - 1)
@@ -233,15 +254,20 @@ candidate cfg@RaftConfig{..} st = do
                    | otherwise = do
       say $ "Awaiting " ++ show n ++ " more votes"
       vote <- receiveWait
-        [ match $ \(votingResponse :: RequestVoteResp) -> do
-            success <- checkVote votingResponse st
+        [ match $ \(req :: RequestVoteReq) -> do
+           (_, success) <- voteFor req st Nothing
+           if success
+             then return (Left (FollowerOf (vreqCandidateId req)))
+             else return (Right n)
+
+        , match $ \(votingResponse :: RequestVoteResp) -> do
+            (_, success) <- checkVote votingResponse st
             if success
               then return (Right (pred n))
               else return (Right n)
 
         , match $ \(req :: AppendEntriesReq a) -> do
-            candidateId <- getSelfNode
-            success <- appendEntries req st (Just candidateId)
+            (_, success) <- appendEntries req st Nothing
             if success
               then return (Left (FollowerOf (areqLeaderId req)))
               else return (Right n)
@@ -249,7 +275,7 @@ candidate cfg@RaftConfig{..} st = do
         , match $ \(Reminder ()) -> do
             return (Left Candidate)
 
-        , matchUnknown (return (Right n))
+        , matchUnknown (say "Unknown message" >> return (Right n))
         ]
       case vote of
         Left newRole -> return newRole
@@ -262,13 +288,13 @@ follower cfg@RaftConfig{..} st votedFor = do
   currentElectionTimeout <- randomElectionTimeout (electionTimeout * 1000)
   res <- receiveTimeout currentElectionTimeout
     [ match $ \req@AppendEntriesReq{..} -> do
-        success <- appendEntries req st votedFor
+        (_, success) <- appendEntries req st votedFor
         if success
           then return (Just areqLeaderId)
           else return votedFor
 
     , match $ \req@RequestVoteReq{..} -> do
-        success <- voteFor req st votedFor
+        (_, success) <- voteFor req st votedFor
         if success
           then return (Just vreqCandidateId)
           else return votedFor
@@ -280,6 +306,63 @@ follower cfg@RaftConfig{..} st votedFor = do
 ----------------------------------------------------------------------
 -- RPC handlers
 
+-- * Election
+
+startElection :: TVar (RaftState a) -> [NodeId] -> Process ()
+startElection st peers = do
+  s@RaftState{..} <- peeks st id
+  let (lastLogTerm, lastLogIndex) = getLastLogItem s
+  candidateId <- getSelfNode
+  let otherPeers = filter (/= candidateId) peers
+
+  -- Send voting requests
+  forM_ otherPeers $ \peer -> do
+    request <- issueRpc st RequestVoteRPC $ \reqid ->
+      RequestVoteReq
+        { vreqRequestId    = reqid
+        , vreqTerm         = currentTerm
+        , vreqCandidateId  = candidateId
+        , vreqLastLogIndex = lastLogIndex
+        , vreqLastLogTerm  = lastLogTerm
+        }
+    sendNode peer request
+
+voteFor :: RequestVoteReq -> TVar (RaftState a) -> Maybe NodeId -> Process (NodeId, Bool)
+voteFor RequestVoteReq{..} st votedFor = do
+  term <- peeks st currentTerm
+  (lastLogTerm, lastLogIndex) <- peeks st getLastLogItem
+  let legitimate = term < vreqTerm || isNothing votedFor
+      granted    = legitimate && vreqLastLogTerm >= lastLogTerm
+                              && vreqLastLogIndex >= lastLogIndex
+
+  if granted
+    then say $ "Voting for " ++ show vreqCandidateId
+    else say $ "Not voting for " ++ show vreqCandidateId
+
+  self <- getSelfNode
+
+  sendNode vreqCandidateId RequestVoteResp
+    { vrespRequestId = vreqRequestId
+    , vrespTerm = term
+    , vrespNodeId = self
+    , vrespVoteGranted = granted
+    }
+
+  return (vreqCandidateId, granted)
+
+checkVote :: RequestVoteResp -> TVar (RaftState a) -> Process (NodeId, Bool)
+checkVote r@RequestVoteResp{..} st = do
+  say $ "Checking vote: " ++ show r
+  pokes st $ \s -> s { currentTerm = max vrespTerm (currentTerm s) }
+  req <- lookupRpc st vrespRequestId
+  case req of
+    Nothing ->
+      return (vrespNodeId, False)
+    Just _  -> do
+      return (vrespNodeId, vrespVoteGranted)
+
+-- * Log replication
+
 sendHeartbeat :: (Serializable a) => TVar (RaftState a) -> NodeId -> Process ()
 sendHeartbeat st node = do
   say $ "Heartbeat to " ++ show node
@@ -288,47 +371,83 @@ sendHeartbeat st node = do
   leaderCommit <- peeks st commitIndex
   log <- peeks st currentLog
 
-  sendNode node $ AppendEntriesReq
-    { areqTerm         = term
-    , areqLeaderId     = leaderId
-    , areqPrevLogIndex = 0
-    , areqPrevLogTerm  = 0
-    , areqEntries      = map snd $ take 0 log
-    , areqLeaderCommit = leaderCommit
-    }
+  request <- issueRpc st AppendEntriesRPC $ \reqid ->
+    AppendEntriesReq
+      { areqRequestId    = reqid
+      , areqTerm         = term
+      , areqLeaderId     = leaderId
+      , areqPrevLogIndex = 0
+      , areqPrevLogTerm  = 0
+      , areqEntries      = map snd $ take 0 log
+      , areqLeaderCommit = leaderCommit
+      }
 
-voteFor :: RequestVoteReq -> TVar (RaftState a) -> Maybe NodeId -> Process Bool
-voteFor RequestVoteReq{..} st votedFor = do
-  say $ "Voting for " ++ show vreqCandidateId
-  term <- peeks st currentTerm
-  let granted = term < vreqTerm || isNothing votedFor
-  sendNode vreqCandidateId RequestVoteResp{ vrespTerm = term, vrespVoteGranted = granted }
-  return granted
+  sendNode node request
 
-checkVote :: RequestVoteResp -> TVar (RaftState a) -> Process Bool
-checkVote RequestVoteResp{..} st = do
-  say $ "Checking vote"
-  pokes st $ \s -> s { currentTerm = max vrespTerm (currentTerm s) }
-  return vrespVoteGranted
-
-appendEntries :: AppendEntriesReq a -> TVar (RaftState a) -> Maybe NodeId -> Process Bool
+appendEntries :: AppendEntriesReq a -> TVar (RaftState a) -> Maybe NodeId -> Process (NodeId, Bool)
 appendEntries AppendEntriesReq{..} st votedFor = do
   say $ "Heartbeat from leader " ++ show areqLeaderId
 
   success <- liftIO $ atomically $ do
-    term <- currentTerm <$> readTVar st
-    if term < areqTerm || (term <= areqTerm && votedFor == Just areqLeaderId)
+    s <- readTVar st
+    let legitimate =
+          areqTerm > (currentTerm s) ||
+          areqTerm == (currentTerm s) && votedFor == Just areqLeaderId
+
+        (lastLogTerm, lastLogIndex) = getLastLogItem s
+
+        canAppend =
+          areqPrevLogTerm == lastLogTerm  &&
+          areqPrevLogIndex == lastLogIndex
+
+        newEntries = zip (zip (repeat areqTerm) [lastLogIndex..]) areqEntries
+
+    if legitimate && canAppend
       then do
-        modifyTVar st $ \s -> s { currentTerm = max areqTerm term }
+        modifyTVar st $ \s ->
+          s { currentTerm = max areqTerm (currentTerm s)
+            , currentLog = reverse newEntries ++ currentLog s
+            }
         return True
       else
         return False
 
-  return success
+  self <- getSelfNode
+  newTerm <- peeks st currentTerm
+  sendNode areqLeaderId AppendEntriesResp
+    { arespRequestId = areqRequestId
+    , arespTerm = newTerm
+    , arespNodeId = self
+    , arespSuccess = success
+    }
 
-checkCommit :: AppendEntriesResp -> TVar (RaftState a) -> Process Bool
-checkCommit AppendEntriesResp{..} _ =
-  return False
+  return (areqLeaderId, success)
+
+checkCommit :: AppendEntriesResp -> TVar (RaftState a) -> Process (NodeId, Bool)
+checkCommit AppendEntriesResp{..} st = do
+
+  liftIO $ atomically $ do
+    let modifyNextIndex idx =
+          if arespSuccess
+          then idx
+          else pred idx
+
+        modifyMatchIndex _idx =
+          if arespSuccess
+          then undefined
+          else undefined
+
+    modifyTVar st $ \s ->
+      s { nextIndex  = M.adjust modifyNextIndex arespNodeId (nextIndex s)
+        , matchIndex = M.adjust modifyMatchIndex arespNodeId (matchIndex s)
+        , currentTerm = max arespTerm (currentTerm s)
+        }
+
+  if arespSuccess
+    then say "Successful append from follower"
+    else say "Unsuccessful append from follower"
+
+  return (arespNodeId, arespSuccess)
 
 ----------------------------------------------------------------------
 -- Utils
@@ -352,8 +471,7 @@ remindAfter micros payload = do
     send pid (Reminder payload)
 
 quorumCount :: NodeId -> [NodeId] -> Int
-quorumCount me peers =
-  (length (filter (/=me) peers) + 2) `div` 2
+quorumCount me peers = 1 + (length (filter (/=me) peers) + 1) `div` 2
 
 randomElectionTimeout :: Int -> Process Int
 randomElectionTimeout base =
