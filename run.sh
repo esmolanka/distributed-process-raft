@@ -4,12 +4,15 @@ EXE=$(stack exec which raft-test-node)
 
 PIDS=""
 
+name="raft-test-node"
+
+tmux new-session -s $name -d
+tmux select-window -t $name:1
+
 for peer in $(cat peers)
 do
-    echo "Running ${peer}"
-    $EXE $@ --listen ${peer} --peers peers 2> ${peer}.err &
-    PIDS="${PIDS} $!"
-    sleep 0.2s
+    tmux splitw -t $name -h -- $EXE $@ --listen ${peer} --peers peers 2> ${peer}.err
 done
 
-wait $PIDS
+tmux select-layout -t $name tiled
+tmux -2 attach-session -t $name
